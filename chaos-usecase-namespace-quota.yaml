@@ -1,0 +1,220 @@
+# Chaos Engineering Scenario: Application Cannot Scale Due to Namespace Quota Limits
+# Use Case: "Application not able to scale despite HPA criteria met"
+# Description: "Namespace quota limiting the number of pods on otel-demo namespace"
+#
+# This scenario demonstrates a common production issue where:
+# - HPA (Horizontal Pod Autoscaler) is correctly triggering scale-up
+# - But new pods cannot be created due to namespace resource quotas being too restrictive
+# - Result: Application cannot handle increased load, causing performance degradation
+
+---
+# Step 1: Create ResourceQuota that limits pods in the namespace
+# This simulates the problematic quota that prevents scaling
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: otel-demo-pod-quota
+  namespace: otel-demo
+spec:
+  hard:
+    pods: "10"  # Very restrictive limit - only 10 pods allowed
+    requests.cpu: "5"      # CPU request limit
+    requests.memory: "5Gi"  # Memory request limit
+  scopeSelector:
+    matchExpressions:
+      - operator: In
+        scopeName: PriorityClass
+        values: ["default"]
+
+---
+# Step 2: Reduce LimitRange for the namespace
+# This further restricts what resources individual pods can request
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: otel-demo-limit-range
+  namespace: otel-demo
+spec:
+  limits:
+    - type: Pod
+      max:
+        cpu: "1"
+        memory: "512Mi"
+      min:
+        cpu: "100m"
+        memory: "64Mi"
+    - type: Container
+      max:
+        cpu: "1"
+        memory: "512Mi"
+      min:
+        cpu: "100m"
+        memory: "64Mi"
+      defaultRequest:
+        cpu: "200m"
+        memory: "256Mi"
+
+---
+# Step 3: HPA for Frontend Service - Will trigger but fail to scale
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-hpa
+  namespace: otel-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: 2
+  maxReplicas: 10  # Wants to scale to 10 replicas
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70  # Scale when CPU > 70%
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Step 4: HPA for Cart Service - Will also fail to scale
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cart-hpa
+  namespace: otel-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cart
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Step 5: HPA for Checkout Service - Will also fail to scale
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout-hpa
+  namespace: otel-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Step 6: NetworkPolicy to simulate partial service degradation
+# Restrict traffic to quota/resource monitoring services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: quota-denial-policy
+  namespace: otel-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: otel-demo
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: otel-demo
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: otel-demo
+      ports:
+        - protocol: TCP
+          port: 6379
+
+---
+# Step 7: Monitoring - ServiceMonitor to track HPA failures
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-hpa-alerts
+  namespace: otel-demo
+data:
+  hpa-rules.yml: |
+    groups:
+      - name: hpa_scaling_issues
+        interval: 30s
+        rules:
+          - alert: HPAScalingFailed
+            expr: |
+              kube_hpa_status_current_replicas{namespace="otel-demo"} 
+              == 
+              kube_hpa_status_desired_replicas{namespace="otel-demo"}
+            for: 5m
+            annotations:
+              summary: "HPA unable to scale {{ $labels.horizontalpodautoscaler }}"
+              description: "HPA cannot create new pods due to resource quota limits"
+
+          - alert: ResourceQuotaExceeded
+            expr: |
+              kube_resourcequota_pods_used{namespace="otel-demo"} 
+              / 
+              kube_resourcequota_pods_hard{namespace="otel-demo"} > 0.9
+            for: 2m
+            annotations:
+              summary: "Pod quota at {{ $value | humanizePercentage }} in otel-demo"
+              description: "Namespace quota is nearly full, HPA scaling will fail"
+
+          - alert: PodPendingDueToQuota
+            expr: |
+              sum(kube_pod_status_phase{namespace="otel-demo", phase="Pending"}) by (namespace)
+              > 0
+            for: 3m
+            annotations:
+              summary: "Pending pods detected in otel-demo"
+              description: "Pods stuck in Pending state due to quota limits"
