@@ -69,9 +69,10 @@ fi
 echo "Acquiring advisory lock id=$LOCKID on database=$DB in pod=$POD (ns=$NAMESPACE) for ${DURATION}s"
 
 # Build psql command and run it in background inside the pod using nohup
-PSQL_CMD="PGPASSWORD='$PGPASSWORD' psql -v ON_ERROR_STOP=1 -U '$USER' -d '$DB' -c \"BEGIN; SELECT pg_advisory_lock(${LOCKID}); SELECT pg_sleep(${DURATION}); COMMIT;\""
+# NOTE: use single quotes around the SQL so parentheses are not mis-parsed by bash
+PSQL_CMD="PGPASSWORD='$PGPASSWORD' psql -v ON_ERROR_STOP=1 -U '$USER' -d '$DB' -c 'BEGIN; SELECT pg_advisory_lock(${LOCKID}); SELECT pg_sleep(${DURATION}); COMMIT;'"
 
-# Use nohup so the session can run in background inside the pod
-kubectl exec -n "$NAMESPACE" "$POD" -- bash -lc "nohup bash -lc \"$PSQL_CMD\" >/dev/null 2>&1 &" 
+# Run PSQL_CMD in background inside the pod
+kubectl exec -n "$NAMESPACE" "$POD" -- bash -lc "nohup $PSQL_CMD >/dev/null 2>&1 &"
 
 echo "Lock acquire command dispatched to pod $POD. It will hold the lock for ${DURATION}s (or until terminated)."
