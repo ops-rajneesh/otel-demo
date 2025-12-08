@@ -10,7 +10,6 @@ set -euo pipefail
 
 NAMESPACE="default"
 POD=""
-LABEL=""
 DB="${POSTGRES_DB:-postgres}"
 USER="${POSTGRES_USER:-root}"
 LOCKID=424242
