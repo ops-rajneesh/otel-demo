@@ -1,39 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Acquire a PostgreSQL advisory lock inside the Postgres container and hold it
-# for a specified duration to simulate DB locking that causes downstream
-# failures (e.g. order fulfillment blocking).
+# Acquire a PostgreSQL advisory lock inside a Postgres pod in Kubernetes and hold it
+# for a specified duration. This is the k8s equivalent of `db_lock_acquire.sh`.
 #
 # Usage:
-#   ./db_lock_acquire.sh [-c container] [-d dbname] [-U user] [-l lockid] -t seconds
-# Defaults assume docker-compose service `postgresql` with env vars set in compose.
+#  ./db_lock_acquire_k8s.sh -n namespace [-p pod] [-l label] [-d dbname] [-U user] [-L lockid] -t seconds [-P password]
+# Provide either `-p pod` or `-l label` (label selector) to locate the Postgres pod.
 
-CONTAINER="postgresql"
+NAMESPACE="default"
+POD=""
+LABEL=""
 DB="${POSTGRES_DB:-postgres}"
 USER="${POSTGRES_USER:-root}"
 LOCKID=424242
-DURATION=30
+DURATION=""
+PGPASSWORD="${POSTGRES_PASSWORD:-}"
 
 usage(){
   cat <<EOF
-Usage: $0 [-c container] [-d dbname] [-U user] [-l lockid] -t seconds
-  -c container   Postgres container name (default: postgresql)
-  -d dbname      Database name (default: from POSTGRES_DB or 'postgres')
-  -U user        Postgres user (default: from POSTGRES_USER or 'root')
-  -l lockid      Advisory lock id (integer, default: ${LOCKID})
+Usage: $0 -t seconds [-n namespace] [-p pod] [-l label] [-d dbname] [-U user] [-L lockid] [-P password]
+  -n namespace   Kubernetes namespace (default: default)
+  -p pod         Exact Postgres pod name to exec into
+  -l label       Label selector to find a Postgres pod (e.g. "app=postgresql")
+  -d dbname      Database name (default from POSTGRES_DB or 'postgres')
+  -U user        DB user (default from POSTGRES_USER or 'root')
+  -L lockid      Advisory lock id (default: ${LOCKID})
   -t seconds     Duration to hold the lock (required)
+  -P password    Postgres password (optional) or set via POSTGRES_PASSWORD env
 EOF
   exit 2
 }
 
-while getopts ":c:d:U:l:t:" opt; do
+while getopts ":n:p:l:d:U:L:t:P:" opt; do
   case $opt in
-    c) CONTAINER="$OPTARG" ;;
+    n) NAMESPACE="$OPTARG" ;;
+    p) POD="$OPTARG" ;;
+    l) LABEL="$OPTARG" ;;
     d) DB="$OPTARG" ;;
     U) USER="$OPTARG" ;;
-    l) LOCKID="$OPTARG" ;;
+    L) LOCKID="$OPTARG" ;;
     t) DURATION="$OPTARG" ;;
+    P) PGPASSWORD="$OPTARG" ;;
     *) usage ;;
   esac
 done
@@ -43,16 +51,27 @@ if [ -z "$DURATION" ]; then
   usage
 fi
 
-echo "Acquiring advisory lock id=$LOCKID on database=$DB (container=$CONTAINER) for ${DURATION}s"
+# Find pod if not provided
+if [ -z "$POD" ]; then
+  if [ -n "$LABEL" ]; then
+    POD=$(kubectl get pods -n "$NAMESPACE" -l "$LABEL" -o jsonpath='{.items[0].metadata.name}') || true
+  else
+    # try to heuristically find a postgres pod name containing "postgres"
+    POD=$(kubectl get pods -n "$NAMESPACE" --no-headers -o custom-columns=":metadata.name" | grep -i postgres | head -n1 || true)
+  fi
+fi
 
-# Run a background psql session inside the container that acquires the advisory lock
-# and sleeps for the requested duration inside the transaction so the lock is held.
+if [ -z "$POD" ]; then
+  echo "Could not find Postgres pod. Specify with -p POD or -l label selector." >&2
+  exit 3
+fi
 
-docker exec -d "$CONTAINER" bash -lc "psql -v ON_ERROR_STOP=1 -U '$USER' -d '$DB' <<'SQL'
-BEGIN;
-SELECT pg_advisory_lock(${LOCKID});
-SELECT pg_sleep(${DURATION});
-COMMIT;
-SQL"
+echo "Acquiring advisory lock id=$LOCKID on database=$DB in pod=$POD (ns=$NAMESPACE) for ${DURATION}s"
 
-echo "Lock acquired (background session started)."
+# Build psql command and run it in background inside the pod using nohup
+PSQL_CMD="PGPASSWORD='$PGPASSWORD' psql -v ON_ERROR_STOP=1 -U '$USER' -d '$DB' -c \"BEGIN; SELECT pg_advisory_lock(${LOCKID}); SELECT pg_sleep(${DURATION}); COMMIT;\""
+
+# Use nohup so the session can run in background inside the pod
+kubectl exec -n "$NAMESPACE" "$POD" -- bash -lc "nohup bash -lc \"$PSQL_CMD\" >/dev/null 2>&1 &" 
+
+echo "Lock acquire command dispatched to pod $POD. It will hold the lock for ${DURATION}s (or until terminated)."
