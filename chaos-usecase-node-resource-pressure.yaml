@@ -1,0 +1,123 @@
+# Chaos Engineering Scenario: Node-level Resource Pressure (prevents scale-up)
+# Use Case: "Application not able to scale despite HPA criteria met"
+# Description: Nodes don't have enough free CPU/memory to schedule new pods; even though HPA tries to scale up, new pods stay Pending due to "Insufficient cpu/memory".
+# This file defines a DaemonSet that intentionally consumes large amounts of resource on each node and creates a PrometheusRule to alert.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel-demo
+  labels:
+    name: otel-demo
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-resource-hog
+  namespace: otel-demo
+  labels:
+    app: node-resource-hog
+spec:
+  selector:
+    matchLabels:
+      app: node-resource-hog
+  template:
+    metadata:
+      labels:
+        app: node-resource-hog
+    spec:
+      # Be permissive, but schedule only on linux nodes
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: ""
+          operator: "Exists"
+          effect: "NoSchedule"
+          effect: "NoExecute"
+          # allow scheduling on tainted/master nodes if the cluster allows
+      containers:
+        - name: resource-hog
+          image: alpine:3.18
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - apk add --no-cache stress && \ 
+              echo "Starting stress on `hostname`" && \ 
+              # Start memory hog & cpu hog for a long-lived process
+              stress --vm 2 --vm-bytes 75% --cpu 2 --timeout 99999s
+          resources:
+            requests:
+              cpu: "800m"
+              memory: "3Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          securityContext:
+            # Allow higher privileges if needed for busywork
+            runAsNonRoot: false
+      # Optional: ensure it runs as a DaemonSet on all worker nodes
+---
+# Optional: Add an ephemeral Job to create a pod count pressure on the namespace
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scale-pressure
+  namespace: otel-demo
+  labels:
+    app: scale-pressure
+spec:
+  replicas: 50
+  selector:
+    matchLabels:
+      app: scale-pressure
+  template:
+    metadata:
+      labels:
+        app: scale-pressure
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.24
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+      restartPolicy: Always
+
+---
+# PrometheusRule to alert if HPA desired > current and pods Pending due to Insufficient
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    role: alert-rules
+  name: node-pressure-hpa-alerts
+  namespace: otel-demo
+spec:
+  groups:
+    - name: hpa-issues.rules
+      rules:
+        - alert: HPAScalingFailedDueToInsufficientResources
+          expr: |
+            kube_hpa_status_desired_replicas{namespace="otel-demo"} > kube_hpa_status_current_replicas{namespace="otel-demo"}
+            and sum(kube_node_status_allocatable{resource="memory"}) - sum(kubelet_running_pod_count) < 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HPA can't scale – possible insufficient node resources in namespace otel-demo"
+            description: "HPA has desired replicas > current replicas; nodes have insufficient allocatable resources to schedule new pods."
+
+        - alert: PodPendingInsufficientResources
+          expr: |
+            count(kube_pod_status_phase{phase="Pending",namespace="otel-demo"}) > 0 and
+            count_over_time(kube_pod_container_resource_requests_memory_bytes[5m]) > 0
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pods Pending due to insufficient node resources in otel-demo"
+            description: "Pods are pending in otel-demo namespace due to insufficient node allocatable resources (CPU or memory)."
