@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # Acquire a PostgreSQL advisory lock inside a Postgres pod in Kubernetes and hold it
-# for a specified duration. This is the k8s equivalent of `db_lock_acquire.sh`.
+# for a specified duration. Robust quoting and validation to avoid "not acquiring" errors.
 #
 # Usage:
 #  ./db_lock_acquire_k8s.sh -n namespace [-p pod] [-l label] [-d dbname] [-U user] [-L lockid] -t seconds [-P password]
-# Provide either `-p pod` or `-l label` (label selector) to locate the Postgres pod.
 
-NAMESPACE="otel-demo2"
+NAMESPACE="otel-demo"
 POD=""
+LABEL=""
 DB="${POSTGRES_DB:-postgres}"
 USER="${POSTGRES_USER:-root}"
 LOCKID=424242
@@ -19,7 +19,7 @@ PGPASSWORD="${POSTGRES_PASSWORD:-}"
 usage(){
   cat <<EOF
 Usage: $0 -t seconds [-n namespace] [-p pod] [-l label] [-d dbname] [-U user] [-L lockid] [-P password]
-  -n namespace   Kubernetes namespace (default: default)
+  -n namespace   Kubernetes namespace (default: ${NAMESPACE})
   -p pod         Exact Postgres pod name to exec into
   -l label       Label selector to find a Postgres pod (e.g. "app=postgresql")
   -d dbname      Database name (default from POSTGRES_DB or 'postgres')
@@ -46,32 +46,55 @@ while getopts ":n:p:l:d:U:L:t:P:" opt; do
 done
 
 if [ -z "$DURATION" ]; then
-  echo "Error: duration (-t) is required"
+  echo "Error: duration (-t) is required" >&2
   usage
+fi
+
+# Validate numeric values
+if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+  echo "Error: duration (-t) must be a positive integer (seconds)." >&2
+  exit 2
+fi
+if ! [[ "$LOCKID" =~ ^-?[0-9]+$ ]]; then
+  echo "Error: lock id (-L) must be an integer." >&2
+  exit 2
 fi
 
 # Find pod if not provided
 if [ -z "$POD" ]; then
   if [ -n "$LABEL" ]; then
-    POD=$(kubectl get pods -n "$NAMESPACE" -l "$LABEL" -o jsonpath='{.items[0].metadata.name}') || true
+    POD=$(kubectl get pods -n "$NAMESPACE" -l "$LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
   else
-    # try to heuristically find a postgres pod name containing "postgres"
-    POD=$(kubectl get pods -n "$NAMESPACE" --no-headers -o custom-columns=":metadata.name" | grep -i postgres | head -n1 || true)
+    POD=$(kubectl get pods -n "$NAMESPACE" --no-headers -o custom-columns=":metadata.name" 2>/dev/null | grep -i postgres | head -n1 || true)
   fi
 fi
 
 if [ -z "$POD" ]; then
-  echo "Could not find Postgres pod. Specify with -p POD or -l label selector." >&2
+  echo "Could not find Postgres pod in namespace '$NAMESPACE'. Specify with -p POD or -l label selector." >&2
+  echo "Run: kubectl get pods -n $NAMESPACE" >&2
   exit 3
 fi
 
-echo "Acquiring advisory lock id=$LOCKID on database=$DB in pod=$POD (ns=$NAMESPACE) for ${DURATION}s"
+echo "Will acquire advisory lock id=${LOCKID} on database='${DB}' in pod='${POD}' (ns='${NAMESPACE}') for ${DURATION}s"
 
-# Build psql command and run it in background inside the pod using nohup
-# NOTE: use single quotes around the SQL so parentheses are not mis-parsed by bash
-PSQL_CMD="PGPASSWORD='$PGPASSWORD' psql -v ON_ERROR_STOP=1 -U '$USER' -d '$DB' -c 'BEGIN; SELECT pg_advisory_lock(${LOCKID}); SELECT pg_sleep(${DURATION}); COMMIT;'"
+# Build the SQL content (safe - no inline quoting problems)
+read -r -d '' SQL <<EOF || true
+BEGIN;
+SELECT pg_advisory_lock(${LOCKID});
+-- hold the lock for ${DURATION} seconds
+SELECT pg_sleep(${DURATION});
+COMMIT;
+EOF
 
-# Run PSQL_CMD in background inside the pod
-kubectl exec -n "$NAMESPACE" "$POD" -- bash -lc "nohup $PSQL_CMD >/dev/null 2>&1 &"
+# Create a temporary SQL file on the pod and run it under nohup so it keeps running in background
+# Also write minimal debug log to /tmp/db_lock.log inside the pod (if needed).
+kubectl exec -n "$NAMESPACE" "$POD" -- bash -lc "cat > /tmp/db_lock.sql <<'SQLEOF'
+$SQL
+SQLEOF
+PGPASSWORD='${PGPASSWORD}' nohup bash -lc \"PGPASSWORD='${PGPASSWORD}' psql -v ON_ERROR_STOP=1 -U '${USER}' -d '${DB}' -f /tmp/db_lock.sql >>/tmp/db_lock.log 2>&1 &\" >/dev/null 2>&1 || true"
 
-echo "Lock acquire command dispatched to pod $POD. It will hold the lock for ${DURATION}s (or until terminated)."
+echo "Dispatched lock job to pod '$POD'. Background process will write logs to /tmp/db_lock.log inside the pod."
+echo "To verify run:"
+echo "  kubectl exec -n ${NAMESPACE} ${POD} -- psql -U ${USER} -d ${DB} -c \"SELECT * FROM pg_locks WHERE locktype='advisory';\""
+echo "Or check the job log inside pod:"
+echo "  kubectl exec -n ${NAMESPACE} ${POD} -- tail -n +1 /tmp/db_lock.log || true"
