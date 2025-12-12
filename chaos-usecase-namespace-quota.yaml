@@ -17,9 +17,9 @@ metadata:
   namespace: otel-demo
 spec:
   hard:
-    pods: "30"  # Very restrictive limit - only 10 pods allowed
-    requests.cpu: "10"      # CPU request limit
-    requests.memory: "10Gi"  # Memory request limit
+    pods: "10"  # Very restrictive limit - only 10 pods allowed
+    requests.cpu: "5"      # CPU request limit
+    requests.memory: "5Gi"  # Memory request limit
   scopeSelector:
     matchExpressions:
       - operator: In
