@@ -7,10 +7,6 @@ set -euo pipefail
 # Usage:
 #  ./table_lock.sh [--namespace <ns>] [--pod <pod>] [--user <dbuser>] [--schema <schema>] [--table <table>] [--seconds <secs>] [--sample-interval <s>]
 # If --schema/--table omitted, the script will search known candidate tables and auto-select the first found.
-#
-# Example:
-#  ./table_lock.sh --seconds 120
-#  ./table_lock.sh --schema accounting --table shipping --seconds 60
 
 # Defaults
 NAMESPACE="otel-demo"
@@ -93,7 +89,8 @@ else
     cand_schema=${candidate%%.*}
     cand_table=${candidate##*.}
     echo -n "Searching for ${cand_schema}.${cand_table} ... "
-    found_db=$(kubectl_exec "for db in \$(psql -U $USER -tAc \"SELECT datname FROM pg_database WHERE datistemplate = false\"); do
+    # Use postgres DB to run the listing command so psql has a valid DB to connect to
+    found_db=$(kubectl_exec "for db in \$(psql -U $USER -d postgres -tAc \"SELECT datname FROM pg_database WHERE datistemplate = false\"); do
       if psql -U $USER -d \"\$db\" -tAc \"SELECT 1 FROM information_schema.tables WHERE table_schema = '$cand_schema' AND table_name = '$cand_table'\" | grep -q 1; then
         echo \$db; break;
       fi;
@@ -113,7 +110,7 @@ fi
 # If user provided schema/table but not DB, detect DB containing it
 if [ -n "$SCHEMA" ] && [ -n "$TABLE" ] && [ -z "${DBNAME-}" ]; then
   echo "Detecting database containing ${SCHEMA}.${TABLE} ..."
-  DBNAME=$(kubectl_exec "for db in \$(psql -U $USER -tAc \"SELECT datname FROM pg_database WHERE datistemplate = false\"); do
+  DBNAME=$(kubectl_exec "for db in \$(psql -U $USER -d postgres -tAc \"SELECT datname FROM pg_database WHERE datistemplate = false\"); do
     if psql -U $USER -d \"\$db\" -tAc \"SELECT 1 FROM information_schema.tables WHERE table_schema = '$SCHEMA' AND table_name = '$TABLE'\" | grep -q 1; then
       echo \$db; break;
     fi;
