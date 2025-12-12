@@ -8,7 +8,7 @@ set -euo pipefail
 #  ./db_lock_acquire_k8s.sh -n namespace [-p pod] [-l label] [-d dbname] [-U user] [-L lockid] -t seconds [-P password]
 # Provide either `-p pod` or `-l label` (label selector) to locate the Postgres pod.
 
-NAMESPACE="default"
+NAMESPACE="otel-demo2"
 POD=""
 DB="${POSTGRES_DB:-postgres}"
 USER="${POSTGRES_USER:-root}"
